@@ -1684,6 +1684,10 @@ static void pl330_dotask(unsigned long data)
 		}
 	}
 
+	if (pl330->state == DYING) {
+		pl330->state = INIT; 
+		dump_stack();	
+	}
 	spin_unlock_irqrestore(&pl330->lock, flags);
 
 	return;
