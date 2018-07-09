@@ -45,6 +45,7 @@
 #include <linux/platform_device.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_data/s3c-hsotg.h>
+#include <linux/reset.h>
 
 #include <linux/usb/of.h>
 
@@ -349,6 +350,25 @@ static int dwc2_lowlevel_hw_init(struct dwc2_hsotg *hsotg)
 {
 	int i, clk, ret;
 
+	hsotg->reset = devm_reset_control_get_optional(hsotg->dev, "dwc2");
+	if (IS_ERR(hsotg->reset)) {
+		ret = PTR_ERR(hsotg->reset);
+		switch (ret) {
+		case -EINVAL:
+		case -ENOENT:
+		case -ENOTSUPP:
+			hsotg->reset = NULL;
+			break;
+		default:
+			dev_err(hsotg->dev, "error getting reset control %d\n",
+				ret);
+			return ret;
+		}
+	}
+
+	if (hsotg->reset)
+		reset_control_deassert(hsotg->reset);
+
 	/* Set default UTMI width */
 	hsotg->phyif = GUSBCFG_PHYIF16;
 
@@ -454,6 +474,9 @@ static int dwc2_driver_remove(struct platform_device *dev)
 
 	if (hsotg->ll_hw_enabled)
 		dwc2_lowlevel_hw_disable(hsotg);
+
+	if (hsotg->reset)
+		reset_control_assert(hsotg->reset);
 
 	return 0;
 }
@@ -599,6 +622,11 @@ static int dwc2_driver_probe(struct platform_device *dev)
 	/* Validate parameter values */
 	dwc2_set_parameters(hsotg, params);
 
+	if (of_device_is_compatible(hsotg->dev->of_node,
+				    "rockchip,rk3066-usb"))
+		hsotg->core_params->host_nperio_tx_fifo_size =
+					params->host_nperio_tx_fifo_size;
+
 	dwc2_force_dr_mode(hsotg);
 
 	if (hsotg->dr_mode != USB_DR_MODE_HOST) {
@@ -625,6 +653,19 @@ static int dwc2_driver_probe(struct platform_device *dev)
 	/* Gadget code manages lowlevel hw on its own */
 	if (hsotg->dr_mode == USB_DR_MODE_PERIPHERAL)
 		dwc2_lowlevel_hw_disable(hsotg);
+
+	if (hsotg->dr_mode == USB_DR_MODE_OTG) {
+		struct platform_device *pdev = to_platform_device(hsotg->dev);
+
+		if (hsotg->uphy) {
+			usb_phy_shutdown(hsotg->uphy);
+		} else if (hsotg->plat && hsotg->plat->phy_exit) {
+			hsotg->plat->phy_exit(pdev, hsotg->plat->phy_type);
+		} else {
+			phy_exit(hsotg->phy);
+			phy_power_off(hsotg->phy);
+		}
+	}
 
 	return 0;
 
@@ -656,6 +697,13 @@ static int __maybe_unused dwc2_resume(struct device *dev)
 		ret = __dwc2_lowlevel_hw_enable(dwc2);
 		if (ret)
 			return ret;
+	}
+
+	/* Stop hcd if dr_mode is host and PD is power off when suspend */
+	if (dwc2->op_state == OTG_STATE_A_HOST && dwc2_is_device_mode(dwc2)) {
+		dwc2_hcd_disconnect(dwc2, true);
+		dwc2->op_state = OTG_STATE_B_PERIPHERAL;
+		dwc2->lx_state = DWC2_L3;
 	}
 
 	if (dwc2_is_device_mode(dwc2))
